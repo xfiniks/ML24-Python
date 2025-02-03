@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 import io
 from datetime import datetime
 import uuid
+import os
+from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -29,12 +31,14 @@ class FoodLogStates(StatesGroup):
     waiting_for_manual_cal = State()
     waiting_for_grams = State()    
 
-API_TOKEN = ""
+load_dotenv()
+
+API_TOKEN = os.getenv("BOT_TOKEN")
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
 
 async def get_temperature(city: str) -> float:
-    openweather_api_key = ""
+    openweather_api_key = os.getenv("OPENWEATHER_API_KEY")
     url = "http://api.openweathermap.org/data/2.5/weather"
     async with aiohttp.ClientSession() as session:
         try:
