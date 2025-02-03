@@ -3,12 +3,16 @@ import aiohttp
 import matplotlib.pyplot as plt
 import io
 from datetime import datetime
+import uuid
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BotCommand
+from rapidfuzz import process
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
 
 users = {}
 
@@ -21,6 +25,7 @@ class ProfileStates(StatesGroup):
     calorie_goal = State()
 
 class FoodLogStates(StatesGroup):
+    waiting_for_product_choice = State()
     waiting_for_manual_cal = State()
     waiting_for_grams = State()    
 
@@ -59,36 +64,70 @@ async def get_temperature(city: str) -> float:
             print(f"Ошибка получения погоды: {e}")
             return 20.0
 
-async def get_food_info(food_name: str):
+async def get_food_candidates(food_name: str, limit: int = 5):
     url = "https://world.openfoodfacts.org/cgi/search.pl"
-
     params = {
         "search_terms": food_name,
+        "search_simple": 1,
         "action": "process",
-        "json": 1
+        "json": 1,
+        "page_size": 20
     }
+    results = []
 
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, params=params) as response:
                 data = await response.json()
                 products = data.get("products", [])
-                if products and len(products) > 0:
-                    product = products[0]
-                    nutriments = product.get("nutriments", {})
-                    calories = nutriments.get("energy-kcal_100g")
-                    if calories is None:
-                        calories = nutriments.get("energy-kcal")
-                    if calories is None:
-                        return None
-                    name = product.get("product_name", food_name)
-                    return {"name": name, "calories": float(calories)}
-                else:
-                    return None
+                for prod in products:
+                    if not isinstance(prod, dict):
+                        continue
+                    nutriments = prod.get("nutriments", {})
+                    cal = nutriments.get("energy-kcal_100g")
+                    if cal is None:
+                        cal = nutriments.get("energy-kcal")
+                    if cal is not None:
+                        product_name = prod.get("product_name", "").strip()
+                        if product_name:
+                            results.append({
+                                "name": product_name,
+                                "calories": float(cal)
+                            })
         except Exception as e:
             print(f"Ошибка при получении данных о продукте: {e}")
-            return None
 
+    if not results:
+        return []
+
+    cleaned_results = []
+    for i, item in enumerate(results):
+        if isinstance(item, dict) and "name" in item and isinstance(item["name"], str):
+            cleaned_results.append(item)
+
+    def safe_processor(x):
+        if isinstance(x, dict) and "name" in x and isinstance(x["name"], str):
+            return x["name"]
+        return ""
+
+    fuzzy_matches = process.extract(
+        food_name,
+        cleaned_results,
+        processor=safe_processor,
+        limit=limit
+    )
+
+    final_list = []
+    for match_data, score, _ in fuzzy_matches:
+        if isinstance(match_data, dict):
+            final_list.append({
+                "name": match_data["name"],
+                "calories": match_data["calories"],
+                "score": score
+            })
+
+    final_list.sort(key=lambda x: x["score"], reverse=True)
+    return final_list
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -242,25 +281,77 @@ async def log_food_start(message: types.Message, state: FSMContext):
         await message.answer("Сначала настройте профиль с помощью /set_profile.")
         return
 
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
         await message.answer("Используйте команду: /log_food <название продукта>")
         return
 
-    food_name = args[1].strip()
-    food_info = await get_food_info(food_name)
-    await state.update_data(food_name=food_name)
+    food_name = parts[1].strip()
 
-    if food_info is None:
+    candidates = await get_food_candidates(food_name)
+
+    if not candidates:
         await message.answer("Информация о продукте не найдена. Введите калорийность на 100 г вручную:")
         await state.set_state(FoodLogStates.waiting_for_manual_cal)
-    else:
-        await state.update_data(food_cal_per_100g=food_info["calories"])
-        await message.answer(
-            f"{food_info['name']} – {food_info['calories']} ккал на 100 г.\n"
-            f"Сколько грамм вы съели?"
-        )
-        await state.set_state(FoodLogStates.waiting_for_grams)
+        await state.update_data(food_name=food_name)
+        return
+
+    builder = InlineKeyboardBuilder()
+
+    candidates_dict = {}
+    for candidate in candidates:
+        candidate_id = str(uuid.uuid4())[:8]
+        candidates_dict[candidate_id] = candidate
+
+        name_short = candidate["name"][:20]
+        btn_text = f"{name_short} ({candidate['calories']:.1f} ккал/100г)"
+
+        callback_data = f"choose_food_{candidate_id}"
+
+        builder.button(text=btn_text, callback_data=callback_data)
+
+    builder.button(text="Ввести калорийность вручную", callback_data="choose_food_manual")
+
+    builder.adjust(1)
+    keyboard = builder.as_markup()
+
+    data = await state.get_data()
+    data["candidates_dict"] = candidates_dict
+    await state.update_data(data)
+
+    await message.answer("Найдены похожие продукты", reply_markup=keyboard)
+    await state.set_state(FoodLogStates.waiting_for_product_choice)
+
+@dp.callback_query(FoodLogStates.waiting_for_product_choice)
+async def choose_food_callback(callback: types.CallbackQuery, state: FSMContext):
+    if callback.data == "choose_food_manual":
+        await callback.message.edit_text("Введите калорийность на 100г вручную:")
+        await state.set_state(FoodLogStates.waiting_for_manual_cal)
+        return
+
+    if not callback.data.startswith("choose_food_"):
+        await callback.answer("Некорректный выбор.")
+        return
+
+    candidate_id = callback.data.replace("choose_food_", "")
+
+    data = await state.get_data()
+    candidates_dict = data.get("candidates_dict", {})
+
+    chosen_candidate = candidates_dict.get(candidate_id)
+    if not chosen_candidate:
+        await callback.answer("Некорректный выбор.")
+        return
+
+    cal_per_100g = chosen_candidate["calories"]
+    food_name = chosen_candidate["name"]
+
+    await callback.message.edit_text(
+        f"Вы выбрали: {food_name} ({cal_per_100g:.1f} ккал на 100 г).\nСколько грамм вы съели?"
+    )
+
+    await state.update_data(food_cal_per_100g=cal_per_100g, food_name=food_name)
+    await state.set_state(FoodLogStates.waiting_for_grams)
 
 @dp.message(FoodLogStates.waiting_for_manual_cal)
 async def set_manual_calories(message: types.Message, state: FSMContext):
@@ -273,7 +364,6 @@ async def set_manual_calories(message: types.Message, state: FSMContext):
         return
 
     await state.update_data(food_cal_per_100g=custom_cal)
-
     await message.answer("Калорийность записана. Сколько грамм вы съели?")
     await state.set_state(FoodLogStates.waiting_for_grams)
 
@@ -306,7 +396,7 @@ async def log_food_grams(message: types.Message, state: FSMContext):
     users[user_id]["logged_calories"] += calories_consumed
     users[user_id]["food_logs"].append((datetime.now(), calories_consumed))
 
-    await message.answer(f"Записано: {calories_consumed:.1f} ккал ({food_name}).")
+    await message.answer(f"Записано: {calories_consumed:.1f} ккал (продукт: {food_name}).")
     await state.clear()
 
 @dp.message(Command("log_workout"))
@@ -330,7 +420,7 @@ async def log_workout(message: types.Message):
         "велосипед": 7,
     }
     
-    workout_type = args[0]
+    workout_type = args[1]
 
     if workout_type not in factors:
         await message.answer("Пожалуйста, введите поддерживаемый тип тренировки.")
@@ -350,8 +440,7 @@ async def log_workout(message: types.Message):
     users[user_id]["workout_logs"].append((datetime.now(), burned))
 
     extra_water = (minutes // 30) * 200
-    users[user_id]["logged_water"] += extra_water
-    users[user_id]["water_logs"].append((datetime.now(), extra_water))
+    users[user_id]["water_goal"] += extra_water
     await message.answer(
         f"🏃‍♂️ {workout_type} {minutes:.0f} минут — {burned:.0f} ккал сожжено.\n"
         f"Дополнительно: выпейте {int(extra_water)} мл воды."
